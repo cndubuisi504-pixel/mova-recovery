@@ -9,7 +9,7 @@ export async function getProvider(kind:'metamask'|'phantom'|'walletconnect'):Pro
   const config=await fetch('/api/config').then(r=>r.json());
   if(!config.walletConnectProjectId) throw new Error('WalletConnect needs a project ID from the app operator. You can use an installed wallet or check a public address instead.');
   const {EthereumProvider}=await import('@walletconnect/ethereum-provider');
-  const p=await EthereumProvider.init({projectId:config.walletConnectProjectId,chains:[1],showQrModal:true,methods:['eth_accounts','eth_requestAccounts','eth_chainId'],events:['accountsChanged','chainChanged'],metadata:{name:'Mova Recovery',description:'Read-only Ethereum recovery checker',url:window.location.origin,icons:[]}});
+  const p=await EthereumProvider.init({projectId:config.walletConnectProjectId,chains:[1],showQrModal:true,methods:['eth_accounts','eth_requestAccounts','eth_chainId','eth_sendTransaction'],optionalMethods:['wallet_switchEthereumChain'],events:['accountsChanged','chainChanged'],metadata:{name:'Mova Recovery',description:'Ethereum position checks and owner-approved recovery',url:window.location.origin,icons:[]}});
   await p.connect();
   return p as Provider;
  }

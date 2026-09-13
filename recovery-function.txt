@@ -32,7 +32,7 @@ export function buildResearchWithdrawal(wallet, amount) {
   if (typeof amount !== 'bigint' || amount <= 0n || amount >= 2n**256n) throw new RecoveryError('position_unavailable','No positive ETH position is available to check.');
   return Object.freeze({ account:wallet, to:protocol.contract, data:encodeFunctionData({abi,functionName:'withdraw',args:[amount]}), value:0n });
 }
-export function makeClient(url) { return createPublicClient({chain:mainnet, transport:http(url, {timeout:12000,retryCount:1})}); }
+export function makeClient(url) { return createPublicClient({chain:mainnet, transport:http(url, {timeout:8000,retryCount:0})}); }
 export async function discoverPosition(client, walletInput) {
   const wallet=validateWallet(walletInput);
   if (await client.getChainId() !== 1) throw new RecoveryError('wrong_rpc_network','The checker is not connected to Ethereum Mainnet. Please try later.',503);
@@ -61,16 +61,86 @@ export async function simulateRecovery(client,wallet) {
 }
 
 
+// Discovery adapters: explicit, read-only allowlist. Adding a result does not enable signing.
+export const implementationSlot = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+export const feth = Object.freeze({
+ id:'foundation-feth',name:'Foundation FETH',chainId:1,asset:'FETH',
+ contract:'0x49128CF8ABE9071ee24540a296b5DED3F9D50443',
+ destinationType:'owner_only',status:'controlled_pilot',simulationSupported:true,
+ runtimeSha256:'f493237b9d26fcb9d47fc3685d30e1e17c8302b5d84071394e77642cfa14cfcb',
+ implementation:'0xCc446C3d1738A6e66D366446C37a942c5e750250',
+ implementationSha256:'b3e12fa86626f19fe1d249cf47f9a848fa4cd92fc5b28017d96b77be80ef965b',
+});
+export const fethAbi=[
+ {type:'function',name:'withdrawFrom',stateMutability:'nonpayable',inputs:[{name:'from',type:'address'},{name:'to',type:'address'},{name:'amount',type:'uint256'}],outputs:[]},
+ {type:'event',name:'ETHWithdrawn',inputs:[{name:'from',type:'address',indexed:true},{name:'to',type:'address',indexed:true},{name:'amount',type:'uint256',indexed:false}]},
+ {type:'function',name:'balanceOf',stateMutability:'view',inputs:[{name:'account',type:'address'}],outputs:[{type:'uint256'}]},
+ {type:'function',name:'totalBalanceOf',stateMutability:'view',inputs:[{name:'account',type:'address'}],outputs:[{type:'uint256'}]},
+];
+function hashCode(code){return code&&code!=='0x'?createHash('sha256').update(Buffer.from(code.slice(2),'hex')).digest('hex'):null;}
+function assertCode(code,hash){if(hashCode(code)!==hash)throw new RecoveryError('contract_changed','The contract no longer matches the reviewed discovery version. This check is paused.',503);}
+export async function assertFethVersion(client,blockNumber){
+  const [code,slot,implementationCode]=await Promise.all([
+   client.getCode({address:feth.contract,blockNumber:blockNumber}),
+   client.getStorageAt({address:feth.contract,slot:implementationSlot,blockNumber:blockNumber}),
+   client.getCode({address:feth.implementation,blockNumber:blockNumber}),
+  ]);
+  assertCode(code,feth.runtimeSha256);
+  if(!slot||slot.length!==66||getAddress('0x'+slot.slice(-40))!==getAddress(feth.implementation))throw new RecoveryError('implementation_changed','Foundation’s implementation changed. Its position check is paused until the new version is reviewed.',503);
+  assertCode(implementationCode,feth.implementationSha256);
+}
+function assertBalance(value){if(typeof value!=='bigint'||value<0n)throw new RecoveryError('invalid_balance','The project returned an unexpected balance. Please try again later.',503);}
+const etherdeltaDiscovery={...protocol,simulationSupported:true};
+export const discoveryProjects=[etherdeltaDiscovery,feth];
+export async function readDiscoveryProject(client,project,wallet,block){
+ if(project.id==='etherdelta-eth'){
+  const code=await client.getCode({address:protocol.contract,blockNumber:block.number});assertCode(code,protocol.runtimeSha256);
+  const total=await client.readContract({address:protocol.contract,abi,functionName:'balanceOf',args:[zeroAddress,wallet],blockNumber:block.number});assertBalance(total);
+  return {total,available:total};
+ }
+ if(project.id==='foundation-feth'){
+  await assertFethVersion(client,block.number);
+  const [available,total]=await Promise.all([
+   client.readContract({address:feth.contract,abi:fethAbi,functionName:'balanceOf',args:[wallet],blockNumber:block.number}),
+   client.readContract({address:feth.contract,abi:fethAbi,functionName:'totalBalanceOf',args:[wallet],blockNumber:block.number}),
+  ]);
+  assertBalance(total);assertBalance(available);
+  if(available>total)throw new RecoveryError('inconsistent_balance','Foundation returned inconsistent balances. This check could not be completed.',503);
+  return {total,available};
+ }
+ throw new RecoveryError('unsupported_project','This project is not in the discovery allowlist.');
+}
+function failedProject(project,error){return {protocol:project,state:'check_failed',signingEnabled:false,errorCode:error instanceof RecoveryError?error.code:'project_unavailable',message:error instanceof RecoveryError?error.message:'This project check could not be completed. Please try again. A failed check does not mean your balance is zero.'};}
+export async function discoverProjects(client,walletInput){
+ const wallet=validateWallet(walletInput);
+ if(await client.getChainId()!==1)throw new RecoveryError('wrong_rpc_network','The checker is not connected to Ethereum Mainnet. Please try later.',503);
+ const block=await client.getBlock({blockTag:'latest'});
+ if(block.number===null||!block.hash)throw new RecoveryError('block_unavailable','The network could not provide a confirmed block for this check.',503);
+ const observedAt=new Date().toISOString();
+ let results=await Promise.all(discoveryProjects.map(async project=>{
+  try{
+   const {total,available}=await readDiscoveryProject(client,project,wallet,block);
+   return {wallet,protocol:project,state:total>0n?'position_found':'no_position',amountWei:total.toString(),amount:formatEther(total),availableWei:available.toString(),availableAmount:formatEther(available),lockedWei:(total-available).toString(),lockedAmount:formatEther(total-available),blockNumber:block.number.toString(),blockHash:block.hash,observedAt,signingEnabled:false};
+  }catch(error){return failedProject(project,error);}
+ }));
+ // Reorg or failed canonicality check invalidates every result, never becomes zero.
+ try{
+  if((await client.getBlock({blockNumber:block.number})).hash!==block.hash)throw new RecoveryError('state_changed','Network state changed during this scan. Please check again.',409);
+ }catch(error){results=discoveryProjects.map(project=>failedProject(project,error));}
+ const failures=results.filter(r=>r.state==='check_failed').length;
+ return {schemaVersion:2,chainId:1,wallet,blockNumber:block.number.toString(),blockHash:block.hash,observedAt,state:failures===results.length?'failed':failures?'partial':'complete',results,signingEnabled:false,scope:'Known contracts only. Not a complete wallet history or recovery guarantee.'};
+}
+
 function reply(body,status=200,headers={}){
  return new Response(JSON.stringify(body),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers}});
 }
 export default async function handler(request){
  const path=new URL(request.url).pathname.replace(/\/$/,'');
  const action=path.split('/').pop();
- if(!['config','scan','simulate'].includes(action))return reply({error:'not_found',message:'This action is not available in the research checker.'},404);
+ if(!['config','scan','simulate','discover','pilot-status','prepare-withdrawal','verify-withdrawal','withdrawal-status'].includes(action))return reply({error:'not_found',message:'This action is not available in the research checker.'},404);
  const allowed=action==='config'?'GET':'POST';
  if(request.method!==allowed)return reply({error:'method_not_allowed',message:'This request method is not supported.'},405,{Allow:allowed});
- if(action==='config')return reply({chainId:1,signingEnabled:false,mode:'read_only_research',rpcConfigured:!!process.env.ETHEREUM_RPC_URL,walletConnectProjectId:process.env.WALLETCONNECT_PROJECT_ID||null});
+ if(action==='config')return reply({chainId:1,signingEnabled:false,mode:'research_with_controlled_pilot',pilotAvailable:pilotSettings().enabled,rpcConfigured:!!process.env.ETHEREUM_RPC_URL,projects:discoveryProjects,walletConnectProjectId:process.env.WALLETCONNECT_PROJECT_ID||null});
  try{
   const declared=Number(request.headers.get('content-length'));
   if(declared>2048)return reply({error:'request_too_large',message:'Only a wallet address is needed.'},413);
@@ -78,9 +148,21 @@ export default async function handler(request){
   if(new TextEncoder().encode(text).byteLength>2048)return reply({error:'request_too_large',message:'Only a wallet address is needed.'},413);
   let body;
   try{body=JSON.parse(text);}catch{return reply({error:'invalid_request',message:'The request could not be read. Please try again.'},400);}
-  const wallet=onlyWallet(body);
   const client=makeClient(process.env.ETHEREUM_RPC_URL||'https://ethereum-rpc.publicnode.com');
-  const result=action==='scan'?await discoverPosition(client,wallet):await simulateRecovery(client,wallet);
+  if(action==='verify-withdrawal'||action==='withdrawal-status'){
+   const allowed=action==='verify-withdrawal'?['envelope']:['envelope','hash'];
+   if(!body||typeof body!=='object'||Object.keys(body).some(k=>!allowed.includes(k)))throw new RecoveryError('invalid_request','Unexpected transaction record fields.');
+   return reply(action==='verify-withdrawal'?await verifyPilot(client,body.envelope):await monitorPilot(client,body.envelope,body.hash));
+  }
+  if(['pilot-status','prepare-withdrawal','simulate'].includes(action)){
+   if(!body||typeof body!=='object'||Object.keys(body).some(k=>!['wallet','projectId'].includes(k)))throw new RecoveryError('unsupported_request','Only a wallet and supported project identifier are accepted.');
+   const wallet=validateWallet(body.wallet),project=withdrawalProject(body.projectId);
+   if(action==='pilot-status')return reply(pilotEligibility(wallet,pilotSettings(),project.id));
+   if(action==='prepare-withdrawal')return reply(await preparePilot(client,wallet,pilotSettings(),project.id));
+   return reply(project.id===feth.id?await simulateFethRecovery(client,wallet):await simulateRecovery(client,wallet));
+  }
+  const wallet=onlyWallet(body);
+  const result=action==='discover'?await discoverProjects(client,wallet):action==='scan'?await discoverPosition(client,wallet):await simulateRecovery(client,wallet);
   return reply(result);
  }catch(error){
   if(error instanceof RecoveryError)return reply({error:error.code,message:error.message},error.status);

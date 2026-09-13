@@ -1,0 +1,163 @@
+
+// Controlled owner-only EtherDelta / Foundation FETH-to-ETH withdrawal flow. No server-side signing or broadcast.
+import {createHmac,randomBytes,timingSafeEqual} from 'node:crypto';
+import {decodeEventLog,toHex} from 'viem';
+const PILOT_CONFIRMATIONS=2;
+export function pilotSettings(){
+ const wallets=(process.env.RECOVERY_PILOT_WALLETS||'').split(',').map(x=>x.trim()).filter(x=>isAddress(x,{strict:true})).map(x=>x.toLowerCase());
+ const secret=process.env.RECOVERY_RECORD_SECRET||'';
+ const enabled=process.env.RECOVERY_PILOT_ENABLED==='true'&&process.env.RECOVERY_REVIEW_APPROVED==='true'&&wallets.length>0&&secret.length>=32&&/^https:\/\//.test(process.env.ETHEREUM_RPC_URL||'');
+ return {enabled,wallets,secret,fethReviewed:process.env.RECOVERY_FETH_REVIEW_APPROVED==='true',maxAmount:1000000000000000n,maxFee:1000000000000000n,confirmations:PILOT_CONFIRMATIONS};
+}
+export function pilotEligibility(wallet,settings=pilotSettings(),projectId=protocol.id){
+ wallet=validateWallet(wallet);const project=withdrawalProject(projectId);
+ return {enabled:settings.enabled&&settings.wallets.includes(wallet.toLowerCase())&&(project.id!==feth.id||settings.fethReviewed===true),maxWithdrawalWei:settings.maxAmount.toString(),maxFeeWei:settings.maxFee.toString(),confirmations:settings.confirmations,mode:'controlled_owner_withdrawal',projectId:project.id};
+}
+function requirePilot(wallet,settings,projectId=protocol.id){if(!pilotEligibility(wallet,settings,projectId).enabled)throw new RecoveryError('pilot_disabled','Real withdrawals are restricted to approved test wallets. Your read-only checks remain available.',403);}
+function sealPlan(plan,settings){const body=Buffer.from(JSON.stringify(plan)).toString('base64url');return body+'.'+createHmac('sha256',settings.secret).update(body).digest('hex');}
+export function openPlan(envelope,settings=pilotSettings()){
+ if(typeof envelope!=='string'||envelope.length>1800||settings.secret.length<32)throw new RecoveryError('invalid_plan','This withdrawal record could not be verified. Do not submit another transaction; check your wallet history.',400);
+ const [body,signature,...extra]=envelope.split('.');
+ if(extra.length||!body||!signature||!/^[a-f0-9]{64}$/.test(signature))throw new RecoveryError('invalid_plan','The withdrawal record is invalid.',400);
+ const expected=createHmac('sha256',settings.secret).update(body).digest('hex');
+ if(!timingSafeEqual(Buffer.from(signature,'hex'),Buffer.from(expected,'hex')))throw new RecoveryError('invalid_plan','The withdrawal record could not be authenticated.',400);
+ let plan;try{plan=JSON.parse(Buffer.from(body,'base64url').toString());}catch{throw new RecoveryError('invalid_plan','The withdrawal record is invalid.');}
+ const tx=plan.tx;const project=withdrawalProject(plan.projectId);
+ if(plan.version!==1||!tx||tx.chainId!=='0x1'||tx.from!==plan.wallet||tx.to!==project.contract||tx.value!=='0x0'||!isAddress(plan.wallet)||typeof plan.amountWei!=='string'||!/^\d+$/.test(plan.amountWei))throw new RecoveryError('invalid_plan','The withdrawal record is not a supported recovery.');
+ const amount=BigInt(plan.amountWei);
+ if(amount<=0n||amount>1000000000000000n||tx.data!==buildSupportedWithdrawal(project,plan.wallet,amount).data)throw new RecoveryError('invalid_plan','The transaction does not match the owner-only withdrawal for this project.');
+ return plan;
+}
+function callFields(tx){return {account:tx.from,to:tx.to,data:tx.data,value:BigInt(tx.value),gas:BigInt(tx.gas),gasPrice:BigInt(tx.gasPrice),nonce:Number(BigInt(tx.nonce))};}
+async function verifyFreshPlan(client,plan,settings){
+ requirePilot(plan.wallet,settings,plan.projectId);
+ if(Date.now()>plan.expiresAt)throw new RecoveryError('plan_expired','The verification expired. Review and verify a new request before signing.',409);
+ const project=withdrawalProject(plan.projectId);
+ const position=await discoverWithdrawalPosition(client,plan.wallet,project);
+ if(BigInt(position.amountWei)<BigInt(plan.amountWei))throw new RecoveryError('position_changed','The available position changed. Review a new request.',409);
+ if(BigInt(plan.amountWei)>settings.maxAmount)throw new RecoveryError('amount_limit','The amount exceeds the controlled test limit.');
+ const [nonce,balance,code]=await Promise.all([client.getTransactionCount({address:plan.wallet,blockTag:'pending'}),client.getBalance({address:plan.wallet}),client.getCode({address:plan.wallet})]);
+ if(code&&code!=='0x')throw new RecoveryError('wallet_unsupported','The first controlled test supports standard accounts only, not contract or delegated accounts.');
+ if(BigInt(nonce)!==BigInt(plan.tx.nonce))throw new RecoveryError('nonce_changed','Another wallet transaction is pending or was submitted. Recheck your wallet before reviewing a new request.',409);
+ const fee=BigInt(plan.tx.gas)*BigInt(plan.tx.gasPrice);
+ if(fee>settings.maxFee||balance<fee)throw new RecoveryError('gas_balance','The wallet cannot cover this request within the test fee limit.');
+ try{await client.call({...callFields(plan.tx),blockNumber:BigInt(position.blockNumber)});}catch{throw new RecoveryError('simulation_failed','The exact withdrawal request could not be verified. No transaction was submitted by Mova.',422);}
+ if(project.id===feth.id)await simulateFethTrace(client,plan,BigInt(position.blockNumber));
+ if((await client.getBlock({blockNumber:BigInt(position.blockNumber)})).hash!==position.blockHash)throw new RecoveryError('state_changed','The verification block changed. Verify again.',409);
+ return {simulation:'passed',blockNumber:position.blockNumber,blockHash:position.blockHash,verifiedAt:new Date().toISOString()};
+}
+export async function preparePilot(client,walletInput,settings=pilotSettings(),projectId=protocol.id){
+ const wallet=validateWallet(walletInput),project=withdrawalProject(projectId);requirePilot(wallet,settings,project.id);
+ const position=await discoverWithdrawalPosition(client,wallet,project);const total=BigInt(position.amountWei);
+ if(total<=0n)throw new RecoveryError('position_unavailable','No unlocked funds are available for this withdrawal. Locked FETH is not withdrawable by this path.');
+ const amount=total>settings.maxAmount?settings.maxAmount:total;
+ const basic=buildSupportedWithdrawal(project,wallet,amount);
+ const [nonce,gasPrice,gasEstimate]=await Promise.all([client.getTransactionCount({address:wallet,blockTag:'pending'}),client.getGasPrice(),client.estimateGas(basic)]);
+ const gas=(gasEstimate*120n+99n)/100n;
+ if(gas>300000n||gasPrice<=0n)throw new RecoveryError('fee_unavailable','A reasonable transaction fee could not be prepared. Please try again later.');
+ const tx={from:wallet,to:project.contract,data:basic.data,value:'0x0',chainId:'0x1',gas:toHex(gas),gasPrice:toHex(gasPrice),nonce:toHex(nonce)};
+ const plan={version:1,projectId:project.id,recoveryId:'MOV-'+randomBytes(4).toString('hex').toUpperCase(),wallet,amountWei:amount.toString(),tx,preparedAt:Date.now(),expiresAt:Date.now()+90000,fromBlock:position.blockNumber,fromHash:position.blockHash};
+ const verification=await verifyFreshPlan(client,plan,settings);
+ return {plan,envelope:sealPlan(plan,settings),verification,signingEnabled:true,maxFeeWei:(gas*gasPrice).toString(),estimatedFeeWei:(gasEstimate*gasPrice).toString(),confirmations:settings.confirmations};
+}
+export async function verifyPilot(client,envelope,settings=pilotSettings()){
+ const plan=openPlan(envelope,settings);return verifyFreshPlan(client,plan,settings);
+}
+function txMatches(tx,plan){
+ const expected=plan.tx;
+ return tx.type==='legacy'&&Number(tx.chainId??(tx.v>=35n?Number((tx.v-35n)/2n):null))===1&&tx.from?.toLowerCase()===expected.from.toLowerCase()&&tx.to?.toLowerCase()===expected.to.toLowerCase()&&tx.input?.toLowerCase()===expected.data.toLowerCase()&&tx.value===0n&&BigInt(tx.nonce)===BigInt(expected.nonce)&&tx.gas===BigInt(expected.gas)&&tx.gasPrice===BigInt(expected.gasPrice);
+}
+export async function monitorPilot(client,envelope,hash,settings=pilotSettings()){
+ const plan=openPlan(envelope,settings),project=withdrawalProject(plan.projectId);
+ if(await client.getChainId()!==1)throw new RecoveryError('wrong_rpc_network','Transaction monitoring is unavailable on this network.',503);
+ if(hash!==undefined&&(typeof hash!=='string'||!/^0x[0-9a-fA-F]{64}$/.test(hash)))throw new RecoveryError('invalid_hash','The transaction identifier is invalid.');
+ // No result is trusted from browser storage; re-read the transaction and receipt.
+ let tx=null,receipt=null;
+ if(hash){
+  try{tx=await client.getTransaction({hash});}catch(e){if(e.name!=='TransactionNotFoundError')throw e;}
+  try{receipt=await client.getTransactionReceipt({hash});}catch(e){if(e.name!=='TransactionReceiptNotFoundError')throw e;}
+ }
+ if(tx&&!txMatches(tx,plan))return {status:'transaction_changed',hash,message:'The wallet transaction differs from the request Mova simulated. No recovery ticket will be issued for this record. Check the transaction in your wallet or explorer.'};
+ if(!receipt){
+  const [latestNonce,pendingNonce]=await Promise.all([client.getTransactionCount({address:plan.wallet,blockTag:'latest'}),client.getTransactionCount({address:plan.wallet,blockTag:'pending'})]);
+  if(BigInt(latestNonce)>BigInt(plan.tx.nonce)&&!tx?.blockNumber)return {status:'replaced_or_nonce_used',hash,message:'This nonce has been used. The withdrawal may have been replaced or cancelled. Check your wallet history; Mova will not resubmit it.'};
+  if(!hash)return {status:'submission_unknown',message:BigInt(pendingNonce)>BigInt(plan.tx.nonce)?'A transaction is pending from this wallet. Keep this record and check your wallet; do not submit another recovery.':'No transaction hash was returned. The wallet may still be awaiting approval. Check your wallet before taking any further action.'};
+  return {status:Date.now()-plan.preparedAt>15*60*1000?'confirmation_timeout':'pending',hash,message:Date.now()-plan.preparedAt>15*60*1000?'Confirmation is taking longer than expected. The transaction may still confirm or may have been dropped. Keep monitoring or check your wallet; no transaction will be resubmitted.':'Waiting for an on-chain confirmation.'};
+ }
+ if(!tx)return {status:'pending',hash,message:'The receipt is visible but transaction details are not yet available. Verification is still pending.'};
+ const canonical=await client.getBlock({blockNumber:receipt.blockNumber});
+ if(canonical.hash!==receipt.blockHash)return {status:'pending',hash,message:'The confirmation block changed. Waiting for canonical confirmation.'};
+ if(receipt.status!=='success')return {status:'reverted',hash,message:'The transaction was mined but failed. The withdrawal did not complete; network fees may have been charged.'};
+ const amount=BigInt(plan.amountWei);
+ if(project.id===feth.id){
+  const events=receipt.logs.filter(l=>l.address.toLowerCase()===feth.contract.toLowerCase()).flatMap(l=>{try{const e=decodeEventLog({abi:fethAbi,data:l.data,topics:l.topics});return e.eventName==='ETHWithdrawn'?[e.args]:[];}catch{return [];}});
+  if(events.length!==1||events[0].from?.toLowerCase()!==plan.wallet.toLowerCase()||events[0].to?.toLowerCase()!==plan.wallet.toLowerCase()||events[0].amount!==amount)return {status:'outcome_unverified',hash,message:'The expected owner-directed FETH-to-ETH withdrawal event was not verified. No recovery ticket is available.'};
+  // An upgradeable proxy needs execution-time evidence, not just its current slot.
+  await assertFethVersion(client,receipt.blockNumber);
+  await assertFethVersion(client,undefined);
+  try{const traces=await client.request({method:'trace_transaction',params:[hash]});assertFethTrace(traces,plan,{hash,blockHash:receipt.blockHash});}
+  catch{return {status:'outcome_unverified',hash,message:'The FETH execution path and ETH payment could not be verified. The transaction may have succeeded; check your wallet or explorer. Mova will not resubmit or issue a ticket without this evidence.'};}
+ }else{
+  const events=[];
+  for(const log of receipt.logs){if(log.address.toLowerCase()!==protocol.contract.toLowerCase())continue;try{const e=decodeEventLog({abi,data:log.data,topics:log.topics});if(e.eventName==='Withdraw')events.push(e.args);}catch{}}
+  const event=events.find(e=>e.user?.toLowerCase()===plan.wallet.toLowerCase()&&e.token?.toLowerCase()===zeroAddress&&e.amount===amount);
+  if(events.length!==1||!event)return {status:'outcome_unverified',hash,message:'The receipt did not contain the expected EtherDelta ETH withdrawal. Mova cannot mark this recovery complete.'};
+  const code=await client.getCode({address:protocol.contract});assertCode(code,protocol.runtimeSha256);
+ }
+ if((await client.getBlock({blockNumber:receipt.blockNumber})).hash!==receipt.blockHash)return {status:'pending',hash,message:'The confirmation block changed during verification. Waiting for canonical confirmation.'};
+ const tip=await client.getBlockNumber();const confirmations=Number(tip-receipt.blockNumber+1n);
+ if(confirmations<settings.confirmations)return {status:'confirming',hash,confirmations,requiredConfirmations:settings.confirmations,message:'The withdrawal was mined successfully. Waiting for additional confirmation.'};
+ return {status:'confirmed',hash,confirmations,requiredConfirmations:settings.confirmations,recovery:{recoveryId:plan.recoveryId,wallet:plan.wallet,destination:plan.wallet,contract:project.contract,protocol:project.name,chainId:1,asset:'ETH',amountWei:plan.amountWei,amount:formatEther(amount),transactionHash:hash,blockNumber:receipt.blockNumber.toString(),blockHash:receipt.blockHash,confirmedAt:new Date(Number(canonical.timestamp)*1000).toISOString(),gasFeeWei:(receipt.gasUsed*receipt.effectiveGasPrice).toString()}};
+}
+
+// Explicit adapters: no arbitrary target, calldata, asset, amount or destination from clients.
+export function withdrawalProject(id=protocol.id){
+ if(id===protocol.id)return protocol;if(id===feth.id)return feth;
+ throw new RecoveryError('unsupported_project','This project has no supported withdrawal adapter.');
+}
+export function buildSupportedWithdrawal(project,wallet,amount){
+ wallet=validateWallet(wallet);
+ if(typeof amount!=='bigint'||amount<=0n||amount>=2n**256n)throw new RecoveryError('position_unavailable','No positive available position can be withdrawn.');
+ if(project.id===protocol.id)return buildResearchWithdrawal(wallet,amount);
+ if(project.id!==feth.id)throw new RecoveryError('unsupported_project','Unsupported withdrawal project.');
+ return Object.freeze({account:wallet,to:feth.contract,value:0n,data:encodeFunctionData({abi:fethAbi,functionName:'withdrawFrom',args:[wallet,wallet,amount]})});
+}
+export async function discoverWithdrawalPosition(client,walletInput,project){
+ if(project.id===protocol.id)return discoverPosition(client,walletInput);
+ const wallet=validateWallet(walletInput);
+ if(await client.getChainId()!==1)throw new RecoveryError('wrong_rpc_network','The checker is not connected to Ethereum Mainnet.',503);
+ const block=await client.getBlock({blockTag:'latest'});
+ const {total,available}=await readDiscoveryProject(client,feth,wallet,block);
+ if((await client.getBlock({blockNumber:block.number})).hash!==block.hash)throw new RecoveryError('state_changed','Network state changed. Check this position again.',409);
+ return {wallet,protocol:feth,amountWei:available.toString(),amount:formatEther(available),totalWei:total.toString(),availableWei:available.toString(),availableAmount:formatEther(available),lockedWei:(total-available).toString(),lockedAmount:formatEther(total-available),blockNumber:block.number.toString(),blockHash:block.hash,observedAt:new Date().toISOString(),state:total>0n?'position_found':'no_position',signingEnabled:false};
+}
+export async function simulateFethRecovery(client,wallet){
+ const position=await discoverWithdrawalPosition(client,wallet,feth);
+ const transaction=buildSupportedWithdrawal(feth,position.wallet,BigInt(position.amountWei));
+ const blockNumber=BigInt(position.blockNumber);
+ try{await client.call({...transaction,blockNumber});}catch{throw new RecoveryError('simulation_failed','The available FETH withdrawal could not be simulated. No funds have moved.',422);}
+ if((await client.getBlock({blockNumber})).hash!==position.blockHash)throw new RecoveryError('state_changed','Network state changed. Run the check again.',409);
+ let gasEstimate=null;try{gasEstimate=(await client.estimateGas({...transaction,blockNumber})).toString();}catch{}
+ return {...position,amountWei:position.totalWei,amount:formatEther(BigInt(position.totalWei)),simulation:'passed',gasEstimate,signingEnabled:false,transaction:{from:position.wallet,to:transaction.to,data:transaction.data,value:'0x0',chainId:1},note:'Read-only simulation of available FETH to owner ETH. The capped pilot is prepared separately; locked funds are excluded. Not a recovery or a guarantee against a future proxy upgrade.'};
+}
+// Parity/OpenEthereum trace API. Unknown formats and unavailable tracing fail closed.
+export function assertFethTrace(traces,plan,receipt){
+ const fail=()=>{throw new RecoveryError('execution_unverified','The reviewed FETH implementation and exact owner ETH payment could not be verified.',503);};
+ const eq=(a,b)=>typeof a==='string'&&a.toLowerCase()===b.toLowerCase();
+ if(!Array.isArray(traces)||traces.length!==3)fail();
+ const paths=['[]','[0]','[0,0]'];
+ const ordered=paths.map(path=>traces.filter(t=>JSON.stringify(t.traceAddress)===path));
+ if(ordered.some(x=>x.length!==1))fail();
+ const [root,delegate,payment]=ordered.map(x=>x[0]);
+ for(const t of traces){if(t.type!=='call'||t.error||!t.result)fail();if(receipt&&(!eq(t.transactionHash,receipt.hash)||!eq(t.blockHash,receipt.blockHash)))fail();}
+ if(root.action.callType!=='call'||!eq(root.action.from,plan.wallet)||!eq(root.action.to,feth.contract)||!eq(root.action.input,plan.tx.data)||BigInt(root.action.value)!==0n)fail();
+ if(delegate.action.callType!=='delegatecall'||!eq(delegate.action.from,feth.contract)||BigInt(delegate.action.value)!==0n||!eq(delegate.action.to,feth.implementation)||!eq(delegate.action.input,plan.tx.data))fail();
+ if(payment.action.callType!=='call'||!eq(payment.action.from,feth.contract)||!eq(payment.action.to,plan.wallet)||payment.action.input!=='0x'||BigInt(payment.action.value)!==BigInt(plan.amountWei))fail();
+}
+async function simulateFethTrace(client,plan,blockNumber){
+ try{
+  const {chainId,...tx}=plan.tx;
+  const result=await client.request({method:'trace_call',params:[tx,['trace'],toHex(blockNumber)]});
+  assertFethTrace(result?.trace,plan);
+ }catch{throw new RecoveryError('trace_unavailable','The FETH pilot requires an RPC that can verify the exact execution path and owner ETH payment. This request was not submitted. Read-only balance checks remain available.',503);}
+}
