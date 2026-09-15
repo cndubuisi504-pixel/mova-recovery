@@ -1,0 +1,127 @@
+
+// Stader and Silicon: bounded read-only discovery and simulation. No signing routes.
+import {keccak256,encodeAbiParameters,encodePacked,concatHex} from 'viem';
+export const staderAbi=[{"name":"assetCustodied","type":"function","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"name":"balanceOf","type":"function","inputs":[{"name":"account","type":"address","internalType":"address"}],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"name":"claimWithdrawal","type":"function","inputs":[{"name":"_idx","type":"uint256","internalType":"uint256"}],"outputs":[],"stateMutability":"nonpayable"},{"name":"convertMaticXToPOL","type":"function","inputs":[{"name":"_balance","type":"uint256","internalType":"uint256"}],"outputs":[{"name":"","type":"uint256","internalType":"uint256"},{"name":"","type":"uint256","internalType":"uint256"},{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"name":"getContracts","type":"function","inputs":[],"outputs":[{"name":"_stakeManager","type":"address","internalType":"contract IStakeManager"},{"name":"_maticToken","type":"address","internalType":"contract IERC20Upgradeable"},{"name":"_validatorRegistry","type":"address","internalType":"contract IValidatorRegistry"},{"name":"_polToken","type":"address","internalType":"contract IERC20Upgradeable"}],"stateMutability":"view"},{"name":"getUserWithdrawalRequests","type":"function","inputs":[{"name":"_user","type":"address","internalType":"address"}],"outputs":[{"name":"","type":"tuple[]","components":[{"name":"validatorNonce","type":"uint256","internalType":"uint256"},{"name":"requestEpoch","type":"uint256","internalType":"uint256"},{"name":"validatorAddress","type":"address","internalType":"address"}],"internalType":"struct IMaticX.WithdrawalRequest[]"}],"stateMutability":"view"},{"name":"instantRedeemEnabled","type":"function","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"name":"paused","type":"function","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"name":"requestWithdraw","type":"function","inputs":[{"name":"_amount","type":"uint256","internalType":"uint256"}],"outputs":[],"stateMutability":"nonpayable"},{"name":"terminalRateLocked","type":"function","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"}];
+export const staderProject=Object.freeze({id:'stader-maticx',name:'Stader MaticX',chainId:1,networkName:'Ethereum',asset:'MaticX',contract:'0xf03A7Eb46d01d9EcAA104558C732Cf82f6B6B645',destinationType:'owner_only',status:'read_only_verification',simulationSupported:true,implementation:'0x14e947119d1672A965c719153ED6Ebf7A70eA50D',runtimeSha256:'f493237b9d26fcb9d47fc3685d30e1e17c8302b5d84071394e77642cfa14cfcb',implementationSha256:'4e164de0b547a9f96738a37ce11b3bc389e242b2b69f82d60577a9c14dbd03d2'});
+export const siliconProject=Object.freeze({id:'silicon-exit',name:'Silicon Network',chainId:2355,networkName:'Silicon',asset:'ETH',contract:'0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe',destinationType:'owner_only',status:'execution_under_review',simulationSupported:false});
+const staderStakeManager='0x5e3Ef299fDDf15eAa0432E6e66473ace8c13D908',staderPol='0x455e53CBB86018Ac2B8092FdCd39d8444aFFC3F6';
+export const supportedDiscoveryProjects=[...discoveryProjects,staderProject,siliconProject];
+const quantity=x=>{if(typeof x==='number'&&!Number.isSafeInteger(x))throw new RecoveryError('invalid_response','A service returned an unsupported numeric value.',503);if(!['string','number','bigint'].includes(typeof x)||!/^\d{1,78}$/.test(String(x)))throw new RecoveryError('invalid_response','A service returned an unsupported amount.',503);const value=BigInt(x);if(value>=2n**256n)throw new RecoveryError('invalid_response','A service returned an out-of-range amount.',503);return value;};
+const sunsetSnapshot=(project,wallet,block)=>({protocol:project,wallet,blockNumber:block.number.toString(),blockHash:block.hash,observedAt:new Date().toISOString(),signingEnabled:false});
+const epochAbi=['epoch','withdrawalDelay'].map(name=>({type:'function',name,stateMutability:'view',inputs:[],outputs:[{type:'uint256'}]}));
+export function staderRequestKey(req){return keccak256(encodeAbiParameters([{type:'address'},{type:'uint256'},{type:'uint256'}],[getAddress(req.validatorAddress),quantity(req.validatorNonce),quantity(req.requestEpoch)]));}
+export async function discoverStader(client,walletInput){
+ const wallet=validateWallet(walletInput);if(await client.getChainId()!==1)throw new RecoveryError('wrong_rpc_network','Stader checks require the Ethereum network.',503);
+ const block=await client.getBlock({blockTag:'latest'});const n=block.number;
+ const [code,implCode,slot]=await Promise.all([client.getCode({address:staderProject.contract,blockNumber:n}),client.getCode({address:staderProject.implementation,blockNumber:n}),client.getStorageAt({address:staderProject.contract,slot:implementationSlot,blockNumber:n})]);
+ assertCode(code,staderProject.runtimeSha256);assertCode(implCode,staderProject.implementationSha256);
+ if(!slot||slot.length!==66||getAddress('0x'+slot.slice(-40))!==staderProject.implementation)throw new RecoveryError('implementation_changed','Stader’s implementation changed. This check is paused until reviewed.',503);
+ const read=(functionName,args=[])=>client.readContract({address:staderProject.contract,abi:staderAbi,functionName,args,blockNumber:n});
+ const [balance,requests,contracts,paused,instant,rateLocked,custodied]=await Promise.all([read('balanceOf',[wallet]),read('getUserWithdrawalRequests',[wallet]),read('getContracts'),read('paused'),read('instantRedeemEnabled'),read('terminalRateLocked'),read('assetCustodied')]);assertBalance(balance);
+ if(contracts[0]!==staderStakeManager||contracts[3]!==staderPol)throw new RecoveryError('dependency_changed','Stader’s withdrawal dependencies changed. This check is paused.',503);
+ if(!Array.isArray(requests)||requests.length>64)throw new RecoveryError('large_queue','This address has more withdrawal requests than this checker can safely load. Use Stader’s official withdrawal guide.',503);
+ const [epoch,delay]=await Promise.all(['epoch','withdrawalDelay'].map(functionName=>client.readContract({address:staderStakeManager,abi:epochAbi,functionName,blockNumber:n})));assertBalance(epoch);assertBalance(delay);
+ const queued=requests.map((r,index)=>({index,key:staderRequestKey(r),validatorAddress:getAddress(r.validatorAddress),validatorNonce:r.validatorNonce.toString(),requestEpoch:r.requestEpoch.toString(),eligibleEpoch:(r.requestEpoch+delay).toString(),state:epoch>=r.requestEpoch+delay?'epoch_eligible':'waiting'}));
+ let quoteWei=null;if(balance>0n){try{const quote=await read('convertMaticXToPOL',[balance]);assertBalance(quote[0]);quoteWei=quote[0].toString();}catch{}}
+ if((await client.getBlock({blockNumber:n})).hash!==block.hash)throw new RecoveryError('state_changed','Stader’s verification block changed. Run the check again.',409);
+ return {...sunsetSnapshot(staderProject,wallet,block),state:balance>0n||queued.length?'position_found':'no_position',amountWei:balance.toString(),amount:formatEther(balance),availableWei:balance.toString(),availableAmount:formatEther(balance),stader:{requests:queued,currentEpoch:epoch.toString(),delayEpochs:delay.toString(),paused,instant,rateLocked,custodied,quoteWei,outputToken:staderPol,outputAsset:'POL',executionEnabled:false}};
+}
+export async function simulateStader(client,walletInput,kind,requestKey){
+ if(!['request','claim'].includes(kind))throw new RecoveryError('unsupported_request','Choose a supported Stader check.');
+ const position=await discoverStader(client,walletInput);let transaction,amountWei=null,stage;
+ if(kind==='request'){
+  const balance=BigInt(position.amountWei);if(balance===0n)throw new RecoveryError('position_unavailable','No MaticX balance is available for a new request. Existing requests are checked separately.');
+  if(position.stader.instant)throw new RecoveryError('mode_changed','Stader is in instant-redemption mode. That path needs separate review; no signing is enabled.',409);
+  if(position.stader.paused)throw new RecoveryError('withdrawals_paused','New Stader withdrawal requests are currently paused. Existing claims may follow different rules.',409);
+  const amount=balance<1000000000000000n?balance:1000000000000000n;amountWei=amount.toString();stage='request_only';transaction={account:position.wallet,to:staderProject.contract,data:encodeFunctionData({abi:staderAbi,functionName:'requestWithdraw',args:[amount]}),value:0n};
+ }else{
+  if(typeof requestKey!=='string'||!/^0x[0-9a-fA-F]{64}$/.test(requestKey))throw new RecoveryError('invalid_request','Select a current withdrawal request.');
+  const item=position.stader.requests.find(r=>r.key===requestKey);if(!item)throw new RecoveryError('request_changed','The request changed or was already claimed. Refresh the position.',409);
+  if(item.state!=='epoch_eligible')throw new RecoveryError('not_ready','The required checkpoint epochs have not elapsed. No claim was submitted.',409);
+  stage='claim_only';transaction={account:position.wallet,to:staderProject.contract,data:encodeFunctionData({abi:staderAbi,functionName:'claimWithdrawal',args:[BigInt(item.index)]}),value:0n};
+ }
+ let gasEstimate=null;try{await client.call({...transaction,blockNumber:BigInt(position.blockNumber)});}catch{throw new RecoveryError('simulation_failed','This Stader action did not pass its read-only simulation. No transaction was submitted.',422);}
+ try{gasEstimate=(await client.estimateGas({...transaction,blockNumber:BigInt(position.blockNumber)})).toString();}catch{}
+ if((await client.getBlock({blockNumber:BigInt(position.blockNumber)})).hash!==position.blockHash)throw new RecoveryError('state_changed','The verification block changed. Check again.',409);
+ return {simulation:'passed',stage,amountWei,requestKey:kind==='claim'?requestKey:null,gasEstimate,blockNumber:position.blockNumber,blockHash:position.blockHash,signingEnabled:false,note:kind==='request'?'A small request was simulated, not submitted. Requesting is not recovering; POL arrives only after an eligible claim.':'The freshly located claim was simulated, not submitted. Epoch eligibility alone is not proof of a successful payment.'};
+}
+export function siliconClient(){return createPublicClient({transport:http(process.env.SILICON_RPC_URL||'https://silicon-mainnet.nodeinfra.com',{timeout:8000,retryCount:0})});}
+export async function readSiliconService(path){
+ const base=process.env.SILICON_BRIDGE_API_URL||'https://bridge-service.silicon.network';if(!/^https:\/\//.test(base))throw new RecoveryError('service_unavailable','Silicon’s exit service is not configured correctly.',503);
+ let res;try{res=await fetch(base.replace(/\/$/,'')+path,{headers:{Accept:'application/json'},signal:AbortSignal.timeout(8000)});}catch{throw new RecoveryError('exit_service_unavailable','Silicon’s exit history service is unavailable. This does not mean there are no exits.',503);}
+ if(!res.ok)throw new RecoveryError('exit_service_unavailable','Silicon’s exit history service could not complete the check. Try again later.',503);
+ if(Number(res.headers.get('content-length'))>524288)throw new RecoveryError('large_response','Silicon returned more data than this checker can safely process.',503);
+ const reader=res.body.getReader();let size=0;const parts=[];try{for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>524288)throw Error('too large');parts.push(value);}}catch{await reader.cancel();throw new RecoveryError('large_response','Silicon’s response could not be read safely.',503);}
+ const data=new Uint8Array(size);let offset=0;for(const part of parts){data.set(part,offset);offset+=part.length;}try{return JSON.parse(new TextDecoder().decode(data));}catch{throw new RecoveryError('invalid_response','Silicon’s service returned an unreadable response.',503);}
+}
+const isClaimedAbi=[{type:'function',name:'isClaimed',stateMutability:'view',inputs:[{type:'uint32'},{type:'uint32'}],outputs:[{type:'bool'}]}];
+export function normalizeSiliconDeposit(d,wallet){
+ if(!d||typeof d!=='object'||!isAddress(d.dest_addr,{strict:true})||quantity(d.network_id)>=2n**32n||quantity(d.dest_net)>=2n**32n||quantity(d.leaf_type)>1n)throw new RecoveryError('invalid_response','Silicon returned an unreadable exit record.',503);
+ if(getAddress(d.dest_addr)!==wallet||quantity(d.network_id)!==10n||quantity(d.dest_net)!==0n||quantity(d.leaf_type)!==0n)return null;
+ const count=quantity(d.deposit_cnt);if(count>=2n**32n||quantity(d.global_index)!==(9n<<32n)+count||!isAddress(d.orig_addr,{strict:true})||!/^0x[0-9a-fA-F]{64}$/.test(d.tx_hash||''))throw new RecoveryError('invalid_response','Silicon returned inconsistent exit details.',503);
+ if(quantity(d.orig_net)>=2n**32n)throw new RecoveryError('invalid_response','The token origin network is invalid.',503);
+ return {depositCount:Number(count),globalIndex:String(d.global_index),originNetwork:Number(quantity(d.orig_net)),token:getAddress(d.orig_addr),amountWei:quantity(d.amount).toString(),destination:wallet,sourceHash:d.tx_hash,reportedReady:d.ready_for_claim===true,state:'not_checked',verificationEnabled:quantity(d.orig_net)===0n};
+}
+export async function discoverSilicon(l1,walletInput,l2=siliconClient(),service=readSiliconService){
+ const wallet=validateWallet(walletInput);if(await l2.getChainId()!==2355)throw new RecoveryError('wrong_rpc_network','The Silicon provider is connected to another network.',503);
+ const block=await l2.getBlock({blockTag:'latest'});const balance=await l2.getBalance({address:wallet,blockNumber:block.number});assertBalance(balance);
+ let exits=[],historyError=null,total=null;try{
+  const body=await service('/bridges/'+wallet+'?limit=20&offset=0');if(!body||!Array.isArray(body.deposits)||body.total_cnt===undefined)throw Error();total=Number(quantity(body.total_cnt));if(!Number.isSafeInteger(total))throw Error();
+  const rows=body.deposits;if(rows.length>20||total<rows.length||(total>0&&rows.length===0))throw Error();exits=rows.map(d=>normalizeSiliconDeposit(d,wallet)).filter(Boolean);if(new Set(exits.map(e=>e.globalIndex)).size!==exits.length)throw Error();
+ }catch{exits=[];total=null;historyError='Exit history could not be checked. This is not a zero-exit result. Native ETH below is a separate on-chain read.';}
+ let ethereumBlock=null;if(exits.length){try{if(await l1.getChainId()!==1)throw Error();const b=await l1.getBlock({blockTag:'latest'});ethereumBlock=b.number.toString();await verifySiliconEthereumVersion(l1,b.number);const first=exits.slice(0,5);await Promise.all(first.map(async e=>{try{const claimed=await l1.readContract({address:siliconProject.contract,abi:isClaimedAbi,functionName:'isClaimed',args:[e.depositCount,10],blockNumber:b.number});if(typeof claimed!=='boolean')throw Error();e.state=claimed?'claimed':'unclaimed';}catch{e.state='check_failed';}}));if((await l1.getBlock({blockNumber:b.number})).hash!==b.hash)throw Error();}catch{exits=exits.map(e=>({...e,state:'check_failed'}));}}
+ if((await l2.getBlock({blockNumber:block.number})).hash!==block.hash)throw new RecoveryError('state_changed','Silicon’s verification block changed. Run the check again.',409);
+ return {...sunsetSnapshot(siliconProject,wallet,block),state:balance>0n||exits.some(e=>e.state!=='claimed')?'position_found':'no_position',amountWei:balance.toString(),amount:formatEther(balance),silicon:{exits,historyError,historyTotal:total,historyLimited:total!==null&&total>20,ethereumBlock,executionEnabled:false,sourceVerifiedInThisCheck:false,coverage:'Native ETH and up to 20 returned Ethereum-bound exit records. ERC-20 wallet balances are not checked. Claimed status checked for at most five records; verify an individual exit for fresh evidence. Unchecked records may already be claimed.',deadline:'2026-12-31T03:00:00.000Z'}};
+}
+export async function discoverAllProjects(client,walletInput,l2=siliconClient(),service=readSiliconService){
+ const wallet=validateWallet(walletInput);
+ const [old,stader,silicon]=await Promise.all([
+  discoverProjects(client,wallet).catch(e=>({results:discoveryProjects.map(p=>failedProject(p,e))})),
+  discoverStader(client,wallet).catch(e=>failedProject(staderProject,e)),
+  discoverSilicon(client,wallet,l2,service).catch(e=>failedProject(siliconProject,e))
+ ]);
+ const results=[...old.results,stader,silicon],failed=results.filter(r=>r.state==='check_failed'||r.silicon?.historyError||r.silicon?.exits.some(e=>e.state==='check_failed')).length;
+ return {schemaVersion:3,wallet,chainId:1,blockNumber:old.blockNumber||stader.blockNumber||null,blockHash:old.blockHash||stader.blockHash||null,observedAt:new Date().toISOString(),results,state:results.every(r=>r.state==='check_failed')?'failed':failed?'partial':'complete',signingEnabled:false,scope:'Four bounded project checks across Ethereum and Silicon. Not a complete wallet history or recovery guarantee.'};
+}
+function siliconProofRoot(leaf,index,siblings){if(!/^0x[0-9a-fA-F]{64}$/.test(leaf)||!Array.isArray(siblings)||siblings.length!==32||siblings.some(s=>!/^0x[0-9a-fA-F]{64}$/.test(s)))throw new RecoveryError('invalid_proof','Silicon returned an invalid proof.',503);let current=leaf,n=quantity(index);if(n>=2n**32n)throw new RecoveryError('invalid_proof','The exit index is out of range.',503);for(const sibling of siblings){current=keccak256((n&1n)===0n?concatHex([current,sibling]):concatHex([sibling,current]));n>>=1n;}return current;}
+export function verifySiliconProofData(deposit,proof,wallet){
+ const item=normalizeSiliconDeposit(deposit,wallet);if(!item||item.originNetwork!==0||BigInt(item.amountWei)===0n)throw new RecoveryError('unsupported_exit','This is not a supported Ethereum-origin asset exit to the selected wallet.');
+ if(typeof deposit.metadata!=='string'||deposit.metadata.length>65538||!/^0x(?:[0-9a-fA-F]{2})*$/.test(deposit.metadata)||!/^0x[0-9a-fA-F]{64}$/.test(proof?.main_exit_root)||!/^0x[0-9a-fA-F]{64}$/.test(proof?.rollup_exit_root))throw new RecoveryError('invalid_proof','The exit metadata or roots are invalid.',503);
+ const leaf=keccak256(encodePacked(['uint8','uint32','address','uint32','address','uint256','bytes32'],[0,0,item.token,0,wallet,BigInt(item.amountWei),keccak256(deposit.metadata)]));
+ const local=siliconProofRoot(leaf,BigInt(item.depositCount),proof.merkle_proof);const rollup=siliconProofRoot(local,9n,proof.rollup_merkle_proof);
+ if(rollup.toLowerCase()!==proof.rollup_exit_root.toLowerCase())throw new RecoveryError('invalid_proof','The proof does not match this owner, asset and amount.',503);
+ return {item,leaf,globalRoot:keccak256(concatHex([proof.main_exit_root,proof.rollup_exit_root]))};
+}
+const siliconBridgeEvent=[{type:'event',name:'BridgeEvent',inputs:[{name:'leafType',type:'uint8',indexed:false},{name:'originNetwork',type:'uint32',indexed:false},{name:'originAddress',type:'address',indexed:false},{name:'destinationNetwork',type:'uint32',indexed:false},{name:'destinationAddress',type:'address',indexed:false},{name:'amount',type:'uint256',indexed:false},{name:'metadata',type:'bytes',indexed:false},{name:'depositCount',type:'uint32',indexed:false}]}];
+export async function verifySiliconEthereumVersion(l1,blockNumber){
+const impl='0x66E0120e3c965552a89AcC37b03f762624baC5Ad';
+ const [slot,code,proxyCode]=await Promise.all([l1.getStorageAt({address:siliconProject.contract,slot:implementationSlot,blockNumber}),l1.getCode({address:impl,blockNumber}),l1.getCode({address:siliconProject.contract,blockNumber})]);
+ if(!slot||getAddress('0x'+slot.slice(-40))!==impl)throw new RecoveryError('implementation_changed','Ethereum’s bridge implementation changed. Exit verification is paused.',503);
+ assertCode(proxyCode,'f4d2cd6a2ffce5b755b0826af5cd18c70a8376678d471516fcde3316b47c5c72');
+ assertCode(code,'60196dd30224a21baf9d49668256dddb694b2f25f3ae042c641b148673956aa1');
+}
+// Exact independent rebuild: solc 0.8.20, optimizer 999, Shanghai; full runtime including metadata matches.
+export async function verifySiliconSource(l2,blockNumber){
+ const impl='0x5ac4182A1dd41AeEf465E40B82fd326BF66AB82C';
+ const [slot,code,proxyCode]=await Promise.all([l2.getStorageAt({address:siliconProject.contract,slot:implementationSlot,blockNumber}),l2.getCode({address:impl,blockNumber}),l2.getCode({address:siliconProject.contract,blockNumber})]);
+ if(!slot||getAddress('0x'+slot.slice(-40))!==impl)throw new RecoveryError('implementation_changed','The Silicon source contract version changed. This exit check is paused.',503);
+ assertCode(proxyCode,'6b3fe7f5a7134bb0abe767c03f66ec49448293d6c49ac8c7563cc51cee3ebc6b');assertCode(code,'10a26c2e9fcc6f4fb003cc1b7b903a30d8ca3d158524c4e5786962c3961a9875');
+}
+export async function verifySiliconExit(l1,walletInput,depositCount,l2=siliconClient(),service=readSiliconService){
+ const wallet=validateWallet(walletInput),count=quantity(depositCount);if(count>=2n**32n)throw new RecoveryError('invalid_request','The deposit number is invalid.');
+ if(await l1.getChainId()!==1||await l2.getChainId()!==2355)throw new RecoveryError('wrong_rpc_network','Both Ethereum and Silicon must be available for exit verification.',503);
+ const [data,proofData]=await Promise.all([service('/bridge?deposit_cnt='+count+'&net_id=10'),service('/merkle-proof?deposit_cnt='+count+'&net_id=10')]);
+ if(quantity(data?.deposit?.deposit_cnt)!==count)throw new RecoveryError('invalid_response','The service returned a different exit.',503);
+ const {item,globalRoot}=verifySiliconProofData(data.deposit,proofData?.proof,wallet);
+ const receipt=await l2.getTransactionReceipt({hash:item.sourceHash});if(receipt.status!=='success'||receipt.transactionHash.toLowerCase()!==item.sourceHash.toLowerCase())throw new RecoveryError('source_unverified','The Silicon withdrawal transaction could not be verified.',503);
+ await verifySiliconSource(l2,receipt.blockNumber);
+ const events=receipt.logs.filter(l=>l.address.toLowerCase()===siliconProject.contract.toLowerCase()).flatMap(l=>{try{return[decodeEventLog({abi:siliconBridgeEvent,data:l.data,topics:l.topics}).args];}catch{return[];}});
+ const matching=events.filter(e=>e.leafType===0&&e.originNetwork===0&&e.originAddress.toLowerCase()===item.token.toLowerCase()&&e.destinationNetwork===0&&e.destinationAddress.toLowerCase()===wallet.toLowerCase()&&e.amount===BigInt(item.amountWei)&&e.metadata.toLowerCase()===data.deposit.metadata.toLowerCase()&&BigInt(e.depositCount)===count);
+ if(matching.length!==1)throw new RecoveryError('source_unverified','The source event does not match this exit. No transaction was submitted.',503);
+ const b=await l1.getBlock({blockTag:'latest'});await verifySiliconEthereumVersion(l1,b.number);
+ const actualManager=await l1.readContract({address:siliconProject.contract,abi:[{type:'function',name:'globalExitRootManager',stateMutability:'view',inputs:[],outputs:[{type:'address'}]}],functionName:'globalExitRootManager',blockNumber:b.number});if(typeof actualManager!=='string'||actualManager.toLowerCase()!=='0x580bda1e7a0cfae92fa7f6c20a3794f169ce3cfb')throw new RecoveryError('dependency_changed','Ethereum’s exit-root dependency changed. This proof check is paused.',503);
+ const rootAbi=[{type:'function',name:'globalExitRootMap',stateMutability:'view',inputs:[{type:'bytes32'}],outputs:[{type:'uint256'}]}];
+ const [claimed,registered]=await Promise.all([l1.readContract({address:siliconProject.contract,abi:isClaimedAbi,functionName:'isClaimed',args:[Number(count),10],blockNumber:b.number}),l1.readContract({address:'0x580bda1e7A0CFAe92Fa7F6c20A3794F169CE3CFb',abi:rootAbi,functionName:'globalExitRootMap',args:[globalRoot],blockNumber:b.number})]);if(typeof claimed!=='boolean')throw new RecoveryError('invalid_response','The claimed status could not be read.',503);assertBalance(registered);
+ if((await l1.getBlock({blockNumber:b.number})).hash!==b.hash||(await l2.getBlock({blockNumber:receipt.blockNumber})).hash!==receipt.blockHash)throw new RecoveryError('state_changed','A verification block changed. Check the exit again.',409);
+ return {status:claimed?'already_claimed':registered>0n?'proof_checked':'waiting_for_root',sourceEventVerified:true,proofVerified:true,rootRegistered:registered>0n,claimed,depositCount:Number(count),asset:item.token===zeroAddress?'ETH':item.token,amountWei:item.amountWei,sourceHash:item.sourceHash,ethereumBlock:b.number.toString(),sourceBlock:receipt.blockNumber.toString(),signingEnabled:false,sourceCodeVerified:true,message:claimed?'Ethereum already records this exit as claimed. Do not submit it again. This is not a new Mova recovery.':registered>0n?'The exit proof matches the owner, asset and amount, and its root is registered on Ethereum. Mova execution remains disabled pending production signing and recovery-lifecycle review.':'The source event and proof were checked, but the proof root is not yet registered on Ethereum. This is not a completed recovery.'};
+}

@@ -1,0 +1,68 @@
+MOVA — STADER + SILICON WEBSITE CHECKS UPDATE
+
+IMPORTANT: THIS IS A CHECKS RELEASE, NOT THE COMPLETE RECOVERY RELEASE.
+
+Adds both Stader and Silicon to address-first website discovery:
+- Stader: Ethereum MaticX balance, pending requests, checkpoint eligibility,
+  small request simulation and eligible claim simulation. Claims pay POL.
+- Silicon: native ETH, bounded exit records and individual source/proof/root/
+  claimed-status checks. Does not scan every ERC-20 wallet balance.
+
+Neither new project can submit a withdrawal through Mova in this version.
+No environment switch in this package enables their signing. The UI says so.
+Existing EtherDelta and FETH pilot restrictions and tracking are preserved.
+No real recovery or independent audit is claimed.
+
+The broader wallet investigation was separate. This update checks FOUR
+projects, not every position on 72 chains. Your supplied wallet address and
+its investigation data are NOT embedded in this website package.
+
+PHONE UPDATE — ONE GITHUB COMMIT, EXISTING NETLIFY SITE
+
+1. Download this ZIP and extract it using your phone's Files app.
+2. Open your existing GitHub repository:
+   https://github.com/cndubuisi504-pixel/mova-recovery
+3. At the repository ROOT (where App.tsx and package.json already live),
+   choose Add file > Upload files. You may need Desktop site in the browser.
+4. Select ALL 20 website code/config files from the extracted ZIP together.
+   Replace matching names. Include the new SunsetProjects.tsx and
+   sunset-function.txt files. Keep the existing filenames and capitalization.
+   The two guide files are optional and do not affect the build.
+5. Make ONE commit after all files are selected. Suggested message:
+   Add Stader and Silicon read-only recovery checks
+6. Your EXISTING Git-connected Netlify site should build that commit.
+   Wait for its production deployment to say Published before testing.
+   Do not create a new site or change existing environment secrets.
+7. Check one public address: results should list EtherDelta, Foundation FETH,
+   Stader MaticX and Silicon Network. Open both new detail screens.
+
+Do NOT upload the ZIP itself to GitHub expecting automatic extraction.
+Do NOT drag this source ZIP into Netlify Drop: the backend must be built
+and deployed with the app. Do NOT upload a new nested app/ directory.
+If your live site is not Git-connected to this repository, stop here and
+confirm its current deployment method rather than replacing the site.
+
+Existing build configuration stays:
+  Build command: npm run build
+  Publish directory: dist
+  Netlify functions: netlify/functions
+  Node version: 22
+
+prepare.mjs generates the backend from recovery-function.txt,
+withdrawal-backend.txt and sunset-function.txt during the build.
+There is no prebuilt dist or node_modules folder in this source ZIP.
+
+After publication:
+- Confirm all four project names appear and both new detail screens load.
+- An empty result is not a universal zero-balance statement.
+- An unavailable history service must show an incomplete check, not zero.
+- New Stader/Silicon checks must NOT trigger a wallet transaction prompt.
+- Do not describe a passed simulation or proof as a completed recovery.
+- Existing pending ED/FETH records must not be deleted or resubmitted.
+
+The package has NOT been uploaded or deployed by the assistant.
+One production deploy can use your account's Netlify credits; actual
+remaining credits and plan limits have not been checked.
+
+If you want to keep waiting for full direct Stader/Silicon recovery support,
+do not publish this limited version. The full recovery release remains on hold.
